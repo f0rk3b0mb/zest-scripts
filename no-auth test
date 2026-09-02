@@ -1,0 +1,150 @@
+/*
+ * ZAP Standalone Script (JavaScript / GraalVM engine)
+ * STEP 2: Authorization check — replay every endpoint from the Sites tree
+ *         with Cookie + Authorization headers stripped, and compare the
+ *         response status code against the original (authenticated) baseline
+ *         already stored in ZAP's History.
+ *
+ * Script type: Stand Alone
+ *
+ * Logic:
+ *   Send each endpoint with Cookie/Authorization stripped and report the
+ *   response status code only. Only endpoints included in an in-scope
+ *   ZAP Context are tested (SiteNode.isIncludedInScope()).
+ *   FLAG if status is 2xx (request succeeded with no auth material).
+ *   OK   if status is 401/403 (enforced, expected).
+ *   REVIEW for anything else (500, redirect, etc — check manually).
+ *
+ * References (verified 2026-09-02):
+ * - HttpMessage.cloneAll(): https://github.com/zaproxy/community-scripts/blob/main/httpsender/README.md
+ * - HttpHeader.setHeader(name, null) removes header:
+ *   https://javadoc.io/static/org.zaproxy/zap/2.8.0/org/parosproxy/paros/network/HttpHeader.html
+ * - HttpSender ctor + sendAndReceive: https://groups.google.com/g/zaproxy-develop/c/_RZtqweBSws
+ * - SiteNode walk / isLeaf / getHistoryReference:
+ *   https://github.com/zaproxy/zap-core-help-id_ID/wiki/HelpUiDialogsBeanshell
+ * - SiteNode.isIncludedInScope() (scope check used by ZAP's own active scan controller):
+ *   http://useof.org/java-open-source/org.zaproxy.zap.model.StructuralNode
+ */
+
+var Model       = Java.type("org.parosproxy.paros.model.Model");
+var HttpSender  = Java.type("org.parosproxy.paros.network.HttpSender");
+var Control     = Java.type("org.parosproxy.paros.control.Control");
+var ExtensionHistory = Java.type("org.parosproxy.paros.extension.history.ExtensionHistory");
+var HistoryReference = Java.type("org.parosproxy.paros.model.HistoryReference");
+
+// initiator 6 = MANUAL_REQUEST_INITIATOR
+var httpSender = new HttpSender(
+    Model.getSingleton().getOptionsParam().getConnectionParam(),
+    true,
+    6
+);
+
+var extHistory = Control.getSingleton().getExtensionLoader().getExtension(ExtensionHistory.class);
+
+var siteTree = Model.getSingleton().getSession().getSiteTree();
+var root = siteTree.getRoot();
+
+var results = [];
+
+function pad(str, len) {
+    str = String(str);
+    return str.length >= len ? str.substring(0, len) : str + Array(len - str.length + 1).join(" ");
+}
+
+function testNoAuth(node, path) {
+    var href = node.getHistoryReference();
+    if (href === null || !node.isLeaf()) return;
+    if (!node.isIncludedInScope()) return; // skip nodes not in an in-scope Context
+
+    try {
+        var baseMsg = href.getHttpMessage();
+        var method = baseMsg.getRequestHeader().getMethod();
+        var url = baseMsg.getRequestHeader().getURI().toString();
+
+        // clone the original request so method/body/other headers stay intact
+        var testMsg = baseMsg.cloneAll();
+        testMsg.getRequestHeader().setHeader("Cookie", null);
+        testMsg.getRequestHeader().setHeader("Authorization", null);
+
+        httpSender.sendAndReceive(testMsg, true);
+        if (extHistory !== null) {
+            try {
+                extHistory.addHistory(testMsg, HistoryReference.TYPE_ZAP_USER);
+            } catch (histErr) {
+                // non-fatal, keep going
+            }
+        }
+        var testStatus = testMsg.getResponseHeader().getStatusCode();
+
+        var enforced = (testStatus === 401 || testStatus === 403);
+        var flagged = !enforced && testStatus >= 200 && testStatus < 300;
+
+        var tag = flagged ? "FLAG" : (enforced ? "OK" : "REVIEW");
+        var verdict = flagged
+            ? "no-auth request succeeded (possible missing authz check)"
+            : (enforced ? "rejected as expected" : "unexpected status, check manually");
+
+        results.push({
+            tag: tag, path: path, method: method, url: url,
+            status: testStatus, verdict: verdict
+        });
+    } catch (e) {
+        results.push({
+            tag: "ERROR", path: path, method: "-", url: "-",
+            status: "-", verdict: String(e)
+        });
+    }
+}
+
+function walk(node, path) {
+    var childCount = node.getChildCount();
+    for (var i = 0; i < childCount; i++) {
+        var child = node.getChildAt(i);
+        var newPath = path + " / " + child.getNodeName();
+        testNoAuth(child, newPath);
+        walk(child, newPath);
+    }
+}
+
+print("");
+print("========================================================================");
+print(" AUTHORIZATION CHECK - requests replayed without Cookie/Authorization");
+print("========================================================================");
+walk(root, "");
+
+// ---- sort: FLAG first, then REVIEW, then OK, then ERROR ------------------
+var order = { "FLAG": 0, "REVIEW": 1, "OK": 2, "ERROR": 3 };
+results.sort(function (a, b) { return order[a.tag] - order[b.tag]; });
+
+print("");
+print(pad("TAG", 8) + pad("STATUS", 8) + pad("METHOD", 8) + "URL");
+print("------------------------------------------------------------------------");
+results.forEach(function (r) {
+    print(pad(r.tag, 8) + pad(String(r.status), 8) + pad(r.method, 8) + r.url);
+});
+
+var counts = { FLAG: 0, REVIEW: 0, OK: 0, ERROR: 0 };
+results.forEach(function (r) { counts[r.tag] = (counts[r.tag] || 0) + 1; });
+
+print("");
+print("------------------------------------------------------------------------");
+print("SUMMARY: " + results.length + " endpoint(s) tested  |  " +
+      counts.FLAG + " flagged  |  " +
+      counts.REVIEW + " review  |  " +
+      counts.OK + " ok  |  " +
+      counts.ERROR + " errors");
+print("------------------------------------------------------------------------");
+
+if (counts.FLAG > 0) {
+    print("");
+    print("FLAGGED DETAIL:");
+    results.filter(function (r) { return r.tag === "FLAG"; }).forEach(function (r) {
+        print("  - " + r.method + " " + r.url);
+        print("      path:   " + r.path);
+        print("      status: " + r.status + "  (" + r.verdict + ")");
+    });
+}
+print("");
+
+var ScriptVars = Java.type("org.zaproxy.zap.extension.script.ScriptVars");
+ScriptVars.setGlobalCustomVar("authz.results", JSON.stringify(results));
