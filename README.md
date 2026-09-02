@@ -1,7 +1,7 @@
 ## Zest-Scripts
 zap automation script
 
-This a collection of scripts that can be used in zap to automate some api tests
+This a collection of scripts written in ecmascript/js that can be used in zap to automate some api tests
 
 The following test are covered
 
